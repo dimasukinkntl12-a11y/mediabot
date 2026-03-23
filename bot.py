@@ -39,20 +39,21 @@ async def loading_anim(msg: Message):
     return temp_msg
 # ================= STATES =================
 class AdminStates(StatesGroup):
-    waiting_for_channel_post = State()
-    waiting_for_ref_agree = State()
-    waiting_for_ref_channel = State()
-    waiting_for_vip_group = State()
-    waiting_for_fsub_list = State()
-    waiting_for_broadcast = State()
-    waiting_for_reply = State()
-    waiting_for_new_admin = State()
-    waiting_for_log_group = State() 
+    waiting_for_post_channel = State()
+    waiting_for_fsub = State()
+    waiting_for_fsub_text = State()
+    waiting_for_cover = State()
     waiting_for_qris = State()
     waiting_for_preview = State()
-    waiting_for_manual_cover = State()
-    waiting_for_cover = State()
+    waiting_for_vip_group = State()
+    waiting_for_log_group = State()
+    waiting_for_ref_channel = State()
+    waiting_for_broadcast = State()
+    waiting_for_add_admin = State()
+    waiting_for_del_admin = State()
     waiting_for_add_title = State()
+    waiting_for_manual_cover = State()
+    waiting_for_reply = State()
 
 class MemberStates(StatesGroup):
     waiting_for_ask = State()
@@ -199,7 +200,7 @@ def member_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 DONASI", callback_data="menu_donasi"), InlineKeyboardButton(text="❓ ASK", callback_data="menu_ask")],
         [InlineKeyboardButton(text="💎 ORDER VIP", callback_data="menu_vip"), InlineKeyboardButton(text="👀 PREVIEW VIP", callback_data="vip_preview")],
-        [InlineKeyboardButton(text="🏆 TOP 5 WEEKLY", callback_data="top_weekly"), InlineKeyboardButton(text="🚀 REFERRAL VIP", callback_data="menu_ref")]
+        [InlineKeyboardButton(text="🚀 REFERRAL VIP", callback_data="menu_ref")]
     ])
 
 # ================= MEMBER & FSUB =================
@@ -497,52 +498,200 @@ async def process_vip_ss(m: Message, state: FSMContext):
     )
     await m.reply("✅ Bukti transfer telah dikirim ke Admin. Mohon tunggu proses verifikasi.")
     await state.clear()
+# ================= COMMAND ADMIN UTAMA =================
+@dp.message(Command("ray"))
+async def cmd_ray(m: Message):
+    if not await is_admin(m.from_user.id): return
+    teks = (
+        "🛠 **DAFTAR COMMAND ADMIN** 🛠\n\n"
+        "**MANAJEMEN POSTING & TAMPILAN:**\n"
+        "🔹 `/setpostch` - Set channel untuk posting\n"
+        "🔹 `/setfsub` - Set channel/grup wajib join (FSub)\n"
+        "🔹 `/listfsub` - Lihat daftar FSub saat ini\n"
+        "🔹 `/fsubteks` - Set teks peringatan FSub\n"
+        "🔹 `/setcove` - Set gambar cover default\n"
+        "🔹 `/autocover on` / `/autocover off` - Matikan/nyalakan auto cover\n\n"
+        "**MANAJEMEN VIP & REFERRAL:**\n"
+        "🔹 `/setqris` - Set gambar QRIS VIP\n"
+        "🔹 `/setpreview` - Set media preview VIP\n"
+        "🔹 `/setvipgrup` - Set grup VIP (auto-generate link)\n"
+        "🔹 `/setloggrup` - Set log channel/grup\n"
+        "🔹 `/setreffch` - Set channel tujuan referral\n\n"
+        "**SISTEM ADMIN & BROADCAST:**\n"
+        "🔹 `/setadmin` - Tambah admin baru (Khusus Owner)\n"
+        "🔹 `/delladmin` - Hapus admin (Khusus Owner)\n"
+        "🔹 `/listadmin` - Lihat daftar admin\n"
+        "🔹 `/bc` - Broadcast pesan ke semua user\n"
+        "🔹 `/senddb` - Backup database (Khusus Owner)\n"
+        "🔹 `/update` - Update database dari file (Khusus Owner)"
+    )
+    await m.reply(teks)
 
-# ================= ADMIN & CONFIG =================
-@dp.message(Command("panel"))
-async def admin_panel(message: Message):
-    if not await is_admin(message.from_user.id): return
-    btns = [
-        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="open_settings")],
-        [InlineKeyboardButton(text="🖼 COVER", callback_data="set_cover"), InlineKeyboardButton(text="🖼 QRIS", callback_data="set_qris")],
-        [InlineKeyboardButton(text="📺 PREVIEW", callback_data="set_preview")],
-        [InlineKeyboardButton(text="👑 VIP GROUP", callback_data="set_vip_group")],
-        [InlineKeyboardButton(text="📜 SET LOG GROUP", callback_data="set_log_group")],
-        [InlineKeyboardButton(text="🎯 SET REF CHANNEL", callback_data="set_ref_ch")],
-        [InlineKeyboardButton(text="📡 BC", callback_data="menu_broadcast"), InlineKeyboardButton(text="📦 DB", callback_data="menu_db")],
-        [InlineKeyboardButton(text="❌ TUTUP", callback_data="close_panel")]
-    ]
-    await message.reply("🛠 **PANEL**", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+@dp.message(Command("setadmin"))
+async def cmd_setadmin(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID: return await m.reply("❌ Khusus Owner!")
+    await m.reply("Kirim ID Telegram user yang mau dijadikan Admin:")
+    await state.set_state(AdminStates.waiting_for_add_admin)
 
-@dp.callback_query(F.data == "open_settings")
-async def settings_cb(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return
-    
-    # Ambil status mode saat ini untuk tampilan tombol
-    mode = await get_config("cover_mode", "OFF")
-    status_emoji = "🟢" if mode == "ON" else "🔴"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 POST CH", callback_data="set_post")],
-        [InlineKeyboardButton(text="👥 FSUB", callback_data="set_fsub_list")],
-        # Tombol Baru di sini:
-        [InlineKeyboardButton(text=f"{status_emoji} COVER MODE: {mode}", callback_data="toggle_cover")],
-        [InlineKeyboardButton(text="🔙 KEMBALI", callback_data="close_panel")]
-    ])
-    await c.message.edit_text("⚙️ **CONFIG SETTINGS**", reply_markup=kb)
+@dp.message(AdminStates.waiting_for_add_admin)
+async def process_add_admin(m: Message, state: FSMContext):
+    try:
+        new_admin = int(m.text.strip())
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("INSERT OR IGNORE INTO admins (admin_id) VALUES (?)", (new_admin,))
+            await db.commit()
+        await m.reply(f"✅ User `{new_admin}` berhasil ditambahkan sebagai Admin.")
+    except ValueError:
+        await m.reply("❌ Error: ID harus berupa angka!")
+    await state.clear()
 
-@dp.callback_query(F.data == "toggle_cover")
-async def toggle_cover_handler(c: CallbackQuery):
-    # Ambil status sekarang
-    curr = await get_config("cover_mode", "OFF")
-    # Balik statusnya
-    new_mode = "OFF" if curr == "ON" else "ON"
+@dp.message(Command("delladmin"))
+async def cmd_delladmin(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID: return await m.reply("❌ Khusus Owner!")
+    await m.reply("Kirim ID Telegram Admin yang mau dihapus:")
+    await state.set_state(AdminStates.waiting_for_del_admin)
+
+@dp.message(AdminStates.waiting_for_del_admin)
+async def process_del_admin(m: Message, state: FSMContext):
+    try:
+        target = int(m.text.strip())
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("DELETE FROM admins WHERE admin_id=?", (target,))
+            await db.commit()
+        await m.reply(f"✅ Admin `{target}` berhasil dihapus dari database.")
+    except ValueError:
+        await m.reply("❌ Error: ID harus berupa angka!")
+    await state.clear()
+
+@dp.message(Command("listadmin"))
+async def cmd_listadmin(m: Message):
+    if not await is_admin(m.from_user.id): return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT admin_id FROM admins") as cur:
+            rows = await cur.fetchall()
     
-    await set_config("cover_mode", new_mode)
-    await c.answer(f"✅ Mode Cover diubah ke {new_mode}", show_alert=True)
+    teks = "👑 **DAFTAR ADMIN SAAT INI**\n\n"
+    teks += f"👤 Owner ID: `{OWNER_ID}`\n"
+    if rows:
+        for r in rows:
+            teks += f"👮‍♂️ Admin ID: `{r[0]}`\n"
+    else:
+        teks += "\nBelum ada admin tambahan."
+    await m.reply(teks)
+
+@dp.message(Command("setpostch"))
+async def cmd_setpostch(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...")
+    await m.answer("Kirimkan ID Channel atau Username Channel (@ch) untuk tujuan posting utama:")
+    await state.set_state(AdminStates.waiting_for_post_channel)
+
+@dp.message(AdminStates.waiting_for_post_channel)
+async def process_setpostch(m: Message, state: FSMContext):
+    val = m.text.strip()
+    await set_config("post_channel", val)
+    await m.reply(f"✅ Channel posting berhasil diatur ke: `{val}`")
+    await state.clear()
+
+@dp.message(Command("autocover"))
+async def cmd_autocover(m: Message):
+    if not await is_admin(m.from_user.id): return
+    args = m.text.split()
+    if len(args) < 2:
+        return await m.reply("Gunakan format: `/autocover on` atau `/autocover off`")
     
-    # Refresh menu biar tulisan tombolnya berubah
-    await settings_cb(c)
+    status = args[1].lower()
+    if status in ["on", "off"]:
+        await set_config("auto_cover", status)
+        await m.reply(f"✅ Auto Cover berhasil diubah ke: **{status.upper()}**")
+    else:
+        await m.reply("❌ Pilihan hanya 'on' atau 'off'!")
+
+@dp.message(Command("setcove"))
+async def cmd_setcove(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan Foto/Media untuk dijadikan Cover default:")
+    await state.set_state(AdminStates.waiting_for_cover)
+
+@dp.message(AdminStates.waiting_for_cover)
+async def process_setcove(m: Message, state: FSMContext):
+    if not m.photo:
+        return await m.reply("❌ Mohon kirimkan dalam bentuk FOTO!")
+    file_id = m.photo[-1].file_id
+    await set_config("default_cover", file_id)
+    await m.reply("✅ Cover default berhasil diperbarui!")
+    await state.clear()
+
+@dp.message(Command("setqris"))
+async def cmd_setqris(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan Foto QRIS untuk pembayaran VIP:")
+    await state.set_state(AdminStates.waiting_for_qris)
+
+@dp.message(AdminStates.waiting_for_qris)
+async def process_setqris(m: Message, state: FSMContext):
+    if not m.photo:
+        return await m.reply("❌ Mohon kirimkan dalam bentuk FOTO!")
+    file_id = m.photo[-1].file_id
+    await set_config("qris_image", file_id)
+    await m.reply("✅ Foto QRIS berhasil diperbarui!")
+    await state.clear()
+
+@dp.message(Command("setpreview"))
+async def cmd_setpreview(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan Media (Foto/Video) untuk Preview VIP:")
+    await state.set_state(AdminStates.waiting_for_preview)
+
+@dp.message(AdminStates.waiting_for_preview)
+async def process_setpreview(m: Message, state: FSMContext):
+    file_id = ""
+    if m.photo: file_id = m.photo[-1].file_id
+    elif m.video: file_id = m.video.file_id
+    else: return await m.reply("❌ Kirim Foto atau Video!")
+    
+    await set_config("vip_preview", file_id)
+    await m.reply("✅ Media Preview VIP berhasil diperbarui!")
+    await state.clear()
+
+@dp.message(Command("setvipgrup"))
+async def cmd_setvipgrup(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan ID Grup VIP (Pastikan bot sudah jadi admin di sana):")
+    await state.set_state(AdminStates.waiting_for_vip_group)
+
+@dp.message(AdminStates.waiting_for_vip_group)
+async def process_setvipgrup(m: Message, state: FSMContext):
+    val = m.text.strip()
+    await set_config("vip_group_id", val)
+    await m.reply(f"✅ ID Grup VIP diatur ke: `{val}`")
+    await state.clear()
+
+@dp.message(Command("setloggrup"))
+async def cmd_setlogch(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan ID Channel/Grup Log:")
+    await state.set_state(AdminStates.waiting_for_log_group)
+
+@dp.message(AdminStates.waiting_for_log_group)
+async def process_setlogch(m: Message, state: FSMContext):
+    val = m.text.strip()
+    await set_config("log_channel", val)
+    await m.reply(f"✅ ID Log diatur ke: `{val}`")
+    await state.clear()
+
+@dp.message(Command("setreffch"))
+async def cmd_setreffch(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("⏳ Tunggu sebentar...\nKirimkan Username/ID Channel tujuan Referral:")
+    await state.set_state(AdminStates.waiting_for_ref_channel)
+
+@dp.message(AdminStates.waiting_for_ref_channel)
+async def process_setreffch(m: Message, state: FSMContext):
+    val = m.text.strip()
+    await set_config("ref_channel", val)
+    await m.reply(f"✅ Channel Referral diatur ke: `{val}`")
+    await state.clear()
 
 @dp.callback_query(F.data == "set_post")
 async def set_post_menu(c: CallbackQuery):
@@ -661,101 +810,6 @@ async def vip_decision(c: CallbackQuery):
             await bot.send_message(target_id, "❌ **PEMBAYARAN DITOLAK**\n\nMohon maaf, bukti transfer kamu tidak valid atau tidak terbaca. Silahkan hubungi admin.")
             await c.message.edit_text(f"❌ User `{target_id}` Berhasil di-Reject.")
         except: pass
-
-@dp.callback_query(F.data == "set_post")
-async def set_post_cb(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Username Channel:"); await state.set_state(AdminStates.waiting_for_channel_post)
-
-@dp.message(AdminStates.waiting_for_channel_post)
-async def process_set_post(m: Message, state: FSMContext):
-    await set_config("channel_post", m.text.strip()); await m.reply("✅ Set."); await state.clear()
-
-@dp.callback_query(F.data == "set_cover")
-async def btn_set_cover(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim Foto:"); await state.set_state(AdminStates.waiting_for_cover)
-
-@dp.message(AdminStates.waiting_for_cover, F.photo)
-async def save_cover(m: Message, state: FSMContext):
-    await set_config("cover_file_id", m.photo[-1].file_id); await m.reply("✅ OK."); await state.clear()
-
-@dp.callback_query(F.data == "set_qris")
-async def btn_set_qris(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim QRIS:"); await state.set_state(AdminStates.waiting_for_qris)
-
-@dp.message(AdminStates.waiting_for_qris, F.photo)
-async def save_qris(m: Message, state: FSMContext):
-    await set_config("qris_file_id", m.photo[-1].file_id); await m.reply("✅ OK."); await state.clear()
-
-@dp.callback_query(F.data == "set_preview")
-async def btn_set_prev(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim media preview:"); await state.set_state(AdminStates.waiting_for_preview)
-
-@dp.message(AdminStates.waiting_for_preview)
-async def save_preview(m: Message, state: FSMContext):
-    await set_config("preview_msg_id", str(m.message_id)); await m.reply("✅ OK."); await state.clear()
-
-# ================= SET VIP GROUP =================
-@dp.callback_query(F.data == "set_vip_group")
-async def set_vip_group_btn(c: CallbackQuery, state: FSMContext):
-
-    if not await is_admin(c.from_user.id):
-        return
-
-    await c.message.answer("Kirim username group VIP\ncontoh:\n@vipgroup")
-
-    await state.set_state(AdminStates.waiting_for_vip_group)
-
-
-@dp.message(AdminStates.waiting_for_vip_group)
-async def save_vip_group(m: Message, state: FSMContext):
-
-    await set_config("vip_group", m.text.strip())
-
-    await m.reply("✅ VIP group set")
-
-    await state.clear()
-
-@dp.callback_query(F.data == "menu_broadcast", F.from_user.id == OWNER_ID)
-async def broadcast_cb(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim BC:"); await state.set_state(AdminStates.waiting_for_broadcast)
-
-@dp.message(AdminStates.waiting_for_broadcast, F.from_user.id == OWNER_ID)
-async def process_broadcast(m: Message, state: FSMContext):
-    count = 0
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as cur:
-            async for row in cur:
-                try: await m.copy_to(row[0]); count += 1; await asyncio.sleep(0.05)
-                except: pass
-    await m.reply(f"✅ Terkirim ke {count} user."); await state.clear()
-
-@dp.message(Command("resetfsub"))
-async def reset_fsub_darurat(m: Message):
-    if not await is_admin(m.from_user.id): return
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM config WHERE key='fsub_channels'")
-        await db.commit()
-    await m.reply("✅ **FSUB DIBERSIHKAN TOTAL!**\nSekarang fsub kosong. Silahkan set ulang lewat /panel dengan bener.")
-
-@dp.callback_query(F.data == "close_panel")
-async def close_panel(c: CallbackQuery): await c.message.delete()
-
-@dp.callback_query(F.data == "set_log_group")
-async def set_log_group_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim ID Group untuk Log VIP (Contoh: -100123456789):")
-    await state.set_state(AdminStates.waiting_for_log_group)
-
-# Daftarkan state baru ini di class AdminStates (di paling atas kode)
-# Tambahkan: waiting_for_log_group = State() 
-
-@dp.message(AdminStates.waiting_for_log_group)
-async def save_log_group(m: Message, state: FSMContext):
-    await set_config("log_group", m.text.strip())
-    await m.reply("✅ VIP Log Group Berhasil Diset!")
-    await state.clear()
-
-# --- FITUR 5: TOP 5 WEEKLY ---
-@dp.callback_query(F.data == "top_weekly")
 @dp.callback_query(F.data == "top_weekly")
 async def top_weekly_handler(c: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -796,25 +850,6 @@ async def ref_info(c: CallbackQuery):
     kb = [[InlineKeyboardButton(text="✅ SETUJU & BUAT LINK", callback_data="gen_ref_link")],
           [InlineKeyboardButton(text="📊 CEK STATUS / KLAIM", callback_data="status_ref")]]
     await c.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-# --- SET CHANNEL REFERRAL ---
-@dp.callback_query(F.data == "set_ref_ch")
-async def set_ref_ch_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim username channel (@channel) atau forward pesan dari channel tersebut:")
-    await state.set_state(AdminStates.waiting_for_ref_channel)
-
-@dp.message(AdminStates.waiting_for_ref_channel)
-async def save_ref_ch(m: Message, state: FSMContext):
-    ch_id = ""
-    if m.forward_from_chat: ch_id = m.forward_from_chat.id
-    elif m.text.startswith("@"): ch_id = m.text
-    else: return await m.reply("Gagal. Kirim @username atau forward post.")
-    
-    await set_config("ref_channel", str(ch_id))
-    await m.reply(f"✅ Channel Referral Set: {ch_id}")
-    await state.clear()
-
-# --- GENERATE LINK KHUSUS (Fitur 10) ---
 # --- FITUR 10 & 11: REFERRAL SYSTEM (OPTIMIZED) ---
 
 @dp.callback_query(F.data == "menu_ref")
