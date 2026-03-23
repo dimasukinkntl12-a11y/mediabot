@@ -2,3 +2,5 @@ pyrogram
 pyromod
 tgcrypto
 python-dotenv
+aiogram
+aiosqlite
