@@ -1,994 +1,808 @@
-#asu
 import asyncio
-import uuid
 import os
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
+import json
+import sqlite3
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, 
-    FSInputFile, CallbackQuery, ChatMemberUpdated # <--- Ganti/Tambah ini
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-
-# ================= KONFIGURASI =================
+from aiogram.exceptions import TelegramBadRequest
+# --- KONFIGURASI ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 try:
-    OWNER_ID = int(os.getenv("ADMIN_ID"))
+    OWNER_ID = int(os.getenv("ADMIN_ID")) 
 except (TypeError, ValueError):
-    OWNER_ID = 0
+    OWNER_ID = 0  # Default jika belum di-set
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+DB_NAME = "media.db"
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN belum di-set di Environment Variables Railway!")
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(BASE_DIR, "media.db")
-
-async def loading_anim(msg: Message):
-    frames = ["⏳ Loading", "⏳ Loading.", "⏳ Loading..", "⏳ Loading..."]
-    temp_msg = await msg.answer(frames[0])
-    for _ in range(2): # 2 kali putaran
-        for frame in frames:
-            try:
-                await temp_msg.edit_text(frame)
-                await asyncio.sleep(0.3)
-            except: break
-    return temp_msg
-# ================= STATES =================
+# --- STATES ---
 class AdminStates(StatesGroup):
-    waiting_for_post_channel = State()
     waiting_for_fsub = State()
     waiting_for_fsub_text = State()
+    waiting_for_post_ch = State()
     waiting_for_cover = State()
     waiting_for_qris = State()
     waiting_for_preview = State()
-    waiting_for_vip_group = State()
-    waiting_for_log_group = State()
-    waiting_for_ref_channel = State()
-    waiting_for_broadcast = State()
+    waiting_for_vip_grup = State()
+    waiting_for_log_grup = State()
+    waiting_for_reff_ch = State()
+    waiting_for_bc = State()
     waiting_for_add_admin = State()
     waiting_for_del_admin = State()
-    waiting_for_add_title = State()
+    # Logika Post
+    waiting_for_title = State()
+    waiting_for_more_media = State()
+    waiting_for_update_db = State()
     waiting_for_manual_cover = State()
-    waiting_for_reply = State()
-
-class MemberStates(StatesGroup):
+    # Member Side
     waiting_for_ask = State()
-    waiting_for_donation = State()
+    waiting_for_donation_media = State()
     waiting_for_vip_ss = State()
 
-class PostMedia(StatesGroup):
-    waiting_for_post_title = State()
-    waiting_for_final_confirm = State()
-
-# ================= DATABASE HELPER =================
+class PostData:
+    def __init__(self):
+        self.media_list = [] # List of (file_id, type)
+        self.title = ""
+        self.manual_cover = None 
+# ================= DATABASE HELPER ===============
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Tabel Media Dasar
-        await db.execute("CREATE TABLE IF NOT EXISTS media (code TEXT PRIMARY KEY, file_id TEXT, type TEXT, caption TEXT, title TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, ref_count INTEGER DEFAULT 0, referrer INTEGER)")
         await db.execute("CREATE TABLE IF NOT EXISTS admins (admin_id INTEGER PRIMARY KEY)")
-        await db.execute("CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS media_store (msg_unique_id TEXT PRIMARY KEY, media_data TEXT, title TEXT)")
         
-        # Fitur 4 & 5: Content Analytics & Top Weekly
-        await db.execute("""CREATE TABLE IF NOT EXISTS views (
-            user_id INTEGER, 
-            media_code TEXT, 
-            viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, media_code))""")
-            
-        # Fitur 7: Multi Channel Post
-        await db.execute("CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY, name TEXT)")
-        
-        # Fitur 11: Referral System
-        await db.execute("""CREATE TABLE IF NOT EXISTS referrals (
-            owner_id INTEGER, 
-            invited_user INTEGER PRIMARY KEY, 
-            status TEXT DEFAULT 'valid')""")
-
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # ... (kode create table kamu yang sudah ada) ...
-        
+        # Default Config
+        defaults = [
+            ('auto_cover', 'off'),
+            ('fsub_text', 'Anda belum join, silakan join dibawah ini'),
+            ('fsub_list', ''),
+            ('post_channels', '')
+        ]
+        for k, v in defaults:
+            await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
         await db.commit()
 
-        # --- TAMBAHKAN KODE INI DI BAWAH COMMIT ---
-        try:
-            # Perintah ini untuk nambahin kolom 'title' ke tabel 'media' yang sudah ada
-            await db.execute("ALTER TABLE media ADD COLUMN title TEXT")
-            await db.commit()
-            print("✅ Berhasil menambah kolom title!")
-        except:
-            # Kalau kolomnya sudah ada (setelah running sekali), dia bakal ke sini
-            pass
-            
-        await db.commit()
-# ================= PAYMENT DATABASE =================
-async def init_payment_table():
+async def get_config(key, default=""):
     async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            invoice_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            amount INTEGER,
-            status TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-
-        await db.commit()
-
-async def get_config(key, default=None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as cursor:
+        async with db.execute("SELECT value FROM config WHERE key = ?", (key,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else default
 
 async def set_config(key, value):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
 
-# ================= VIP INVITE LINK =================
-async def send_vip_link(user_id: int):
-
-    vip_group = await get_config("vip_group")
-
-    if not vip_group:
-        await bot.send_message(user_id, "❌ VIP group belum diset admin")
-        return
-
-    try:
-
-        link = await bot.create_chat_invite_link(
-            chat_id=vip_group,
-            member_limit=1
-        )
-
-        await bot.send_message(
-            user_id,
-            f"✅ Payment diterima!\n\nLink VIP kamu:\n{link.invite_link}"
-        )
-
-    except Exception as e:
-
-        await bot.send_message(user_id, f"❌ Error: {e}")
-
-async def is_admin(user_id: int):
+async def is_admin(user_id):
     if user_id == OWNER_ID: return True
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM admins WHERE admin_id=?", (user_id,)) as cur:
-            return await cur.fetchone() is not None
+        async with db.execute("SELECT 1 FROM admins WHERE admin_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
 
-async def check_membership(user_id: int):
-    raw_targets = await get_config("fsub_channels")
-    if not raw_targets or raw_targets.strip() == "": return []
-    
-    # Pecah berdasarkan spasi dan buang string kosong/sampah
-    targets = [t.strip() for t in raw_targets.split() if t.strip()]
-    unjoined = []
-    
-    for target in targets:
-        clean_target = target.replace("https://t.me/", "").replace("@", "")
-        if not clean_target: continue # Lewatin kalau kosong
-        
-        try:
-            m = await bot.get_chat_member(chat_id=f"@{clean_target}", user_id=user_id)
-            if m.status not in ("member", "administrator", "creator"):
-                unjoined.append(clean_target)
-        except Exception:
-            # Kalau channel ga ketemu/bot bukan admin, anggep wajib join
-            unjoined.append(clean_target)
-    return unjoined
-
-# ================= KEYBOARDS =================
-async def get_titles_kb():
-    kb = []
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT title FROM titles ORDER BY id DESC LIMIT 10") as cur:
-            async for row in cur:
-                kb.append([InlineKeyboardButton(text=row[0], callback_data=f"t_sel:{row[0][:20]}")])
-    kb.append([InlineKeyboardButton(text="➕ TAMBAH JUDUL", callback_data="add_title_btn")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-def member_main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 DONASI", callback_data="menu_donasi"), InlineKeyboardButton(text="❓ ASK", callback_data="menu_ask")],
-        [InlineKeyboardButton(text="💎 ORDER VIP", callback_data="menu_vip"), InlineKeyboardButton(text="👀 PREVIEW VIP", callback_data="vip_preview")],
-        [InlineKeyboardButton(text="🚀 REFERRAL VIP", callback_data="menu_ref")]
-    ])
-
-# ================= MEMBER & FSUB =================
-@dp.message(CommandStart())
-async def start_handler(m: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.from_user.id,))
-        await db.commit()
-
-    args = m.text.split()
-    target_code = args[1] if len(args) > 1 else "none"
-
-    unjoined = await check_membership(m.from_user.id)
-    if unjoined:
-        kb_list = []
-        for ch in unjoined:
-            clean_name = ch.replace("@", "")
-            kb_list.append([InlineKeyboardButton(text=f"📢 JOIN {ch.upper()}", url=f"https://t.me/{clean_name}")])
-        
-        kb_list.append([InlineKeyboardButton(text="🔄 COBA LAGI", callback_data=f"check_sub:{target_code}")])
-        return await m.answer("⚠️ **AKSES DIKUNCI**\nSilahkan join channel yang muncul di bawah ini untuk lanjut.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list))
-
-    if target_code != "none":
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT file_id, type, caption FROM media WHERE code=?", (target_code,)) as cur:
-                row = await cur.fetchone()
-                if row:
-                    # LOGIKA ANALYTICS (Fitur 4)
-                    try:
-                        await db.execute("INSERT OR IGNORE INTO views (user_id, media_code) VALUES (?, ?)", 
-                                         (m.from_user.id, target_code))
-                        await db.commit()
-                    except Exception as e:
-                        print(f"Error logging view: {e}")
-                                       
-                    if row[1] == "photo": await bot.send_photo(m.chat.id, row[0], caption=row[2], protect_content=True)
-                    else: await bot.send_video(m.chat.id, row[0], caption=row[2], protect_content=True)
-                    return
-
-    await m.answer(f"👋 Halo {m.from_user.first_name}!", reply_markup=member_main_kb())
-
-@dp.callback_query(F.data.startswith("check_sub:"))
-async def check_sub_cb(c: CallbackQuery):
-    unjoined = await check_membership(c.from_user.id)
-    if unjoined:
-        return await c.answer("❌ Kamu belum join semua channel di atas!", show_alert=True)
-    
-    await c.message.delete()
-    code = c.data.split(":")[1]
-    # Re-trigger start logic
-    new_m = Message(
-        message_id=c.message.message_id, date=c.message.date, chat=c.message.chat,
-        from_user=c.from_user, text=f"/start {code}"
-    )
-    await start_handler(new_m)
-
-# ================= LOGIKA AUTO POST (MULTI-PART) =================
-@dp.message(F.chat.type == "private", (F.photo | F.video | F.document), StateFilter(None))
-async def admin_upload(m: Message, state: FSMContext):
-    if not await is_admin(m.from_user.id): return
-    fid = m.photo[-1].file_id if m.photo else (m.video.file_id if m.video else m.document.file_id)
-    mtype = "photo" if m.photo else "video"
-    await state.update_data(temp_fid=fid, temp_type=mtype, temp_caption=(m.caption or ""), parts=[])
-    await state.set_state(PostMedia.waiting_for_post_title)
-    await m.reply("📝 **PILIH JUDUL:**", reply_markup=await get_titles_kb())
-
-@dp.callback_query(PostMedia.waiting_for_post_title, F.data.startswith("t_sel:"))
-async def select_title_handler(c: CallbackQuery, state: FSMContext):
-    title = c.data.split(":")[1]
-    await add_part_to_list(c.message, state, title)
-
-@dp.callback_query(PostMedia.waiting_for_post_title, F.data == "add_title_btn")
-async def add_new_title_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Ketik judul baru:")
-    await state.set_state(AdminStates.waiting_for_add_title)
-
-@dp.message(AdminStates.waiting_for_add_title)
-async def process_save_title(m: Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO titles (title) VALUES (?)", (m.text,))
-        await db.commit()
-    await add_part_to_list(m, state, m.text)
-
-async def add_part_to_list(msg, state, p_title):
-    data = await state.get_data()
-    code = uuid.uuid4().hex[:15]
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO media (code, file_id, type, caption) VALUES (?, ?, ?, ?)", 
-                         (code, data['temp_fid'], data['temp_type'], data['temp_caption']))
-        await db.commit()
-    
-    parts = data.get('parts', [])
-    parts.append(code)
-    await state.update_data(parts=parts, current_title=p_title)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ TAMBAH PART LAIN", callback_data="add_more_part")],
-        [InlineKeyboardButton(text="🚀 POST SEKARANG", callback_data="final_post")]
-    ])
-    await msg.answer(f"✅ Part {len(parts)} siap.\nJudul: **{p_title}**", reply_markup=kb)
-    await state.set_state(PostMedia.waiting_for_final_confirm)
-
-@dp.callback_query(PostMedia.waiting_for_final_confirm, F.data == "final_post")
-async def check_cover_mode(c: CallbackQuery, state: FSMContext):
-    mode = await get_config("cover_mode", "OFF")
-    
-    if mode == "ON":
-        # JANGAN panggil final_post_select_ch, tapi panggil show_channel_selection
-        await show_channel_selection(c.message, state)
-    else:
-        # Mode OFF, minta cover manual dulu
-        await c.message.answer("🖼 **COVER MODE OFF**\nSilakan kirim foto yang ingin dijadikan cover untuk post ini:")
-        await state.set_state(AdminStates.waiting_for_manual_cover)
-
-@dp.message(AdminStates.waiting_for_manual_cover, F.photo)
-async def handle_manual_cover(m: Message, state: FSMContext):
-    # Simpan file_id cover khusus untuk post ini saja ke state
-    await state.update_data(manual_cover=m.photo[-1].file_id)
-    
-    # Lanjut ke pilih channel (panggil fungsi pilih channel)
-    # Kita buatkan helper untuk panggil menu pilih channel
-    await show_channel_selection(m, state)
-
-async def show_channel_selection(m: Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_id FROM channels") as cur:
-            rows = await cur.fetchall()
-            
-    if not rows:
-        return await m.answer("❌ Daftarkan channel dulu di /panel!")
-        
-    kb = []
-    for r in rows:
-        kb.append([InlineKeyboardButton(text=f"📤 KE: {r[0]}", callback_data=f"send_to:{r[0]}")])
-    kb.append([InlineKeyboardButton(text="🚀 POST KE SEMUA", callback_data="send_to:all")])
-    
-    await m.answer("🎯 **PILIH TUJUAN POSTING:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    
-@dp.callback_query(F.data.startswith("send_to:"))
-async def execute_posting(c: CallbackQuery, state: FSMContext):
-    target = c.data.split(":")[1]
-    data = await state.get_data()
-    
-    # Ambil data yang diperlukan dari state
-    parts = data.get('parts', [])
-    p_title = data.get('current_title', 'Video Baru')
-    
-    # 1. DEFINISIKAN TARGETS (PENTING!)
-    targets = []
-    if target == "all":
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT channel_id FROM channels") as cur:
-                rows = await cur.fetchall()
-                targets = [r[0] for r in rows]
-    else:
-        # Jika cuma satu channel, masukkan ke dalam list
-        targets = [target]
-
-    if not targets:
-        return await c.answer("❌ Tidak ada channel tujuan!", show_alert=True)
-
-    # 2. Buat Keyboard Part
-    bot_info = await bot.get_me()
-    kb_rows = []
-    row = []
-    for i, code in enumerate(parts, 1):
-        row.append(InlineKeyboardButton(text=f"Part {i}", url=f"https://t.me/{bot_info.username}?start={code}"))
-        if len(row) == 2:
-            kb_rows.append(row)
-            row = []
-    if row: kb_rows.append(row)
-    
-    # 3. Tentukan Cover
-    mode = await get_config("cover_mode", "OFF")
-    cover_to_use = await get_config("cover_file_id") if mode == "ON" else data.get("manual_cover")
-
-    # 4. MULAI KIRIM
-    success = 0
-    for ch_id in targets:
-        try:
-            if cover_to_use:
-                await bot.send_photo(
-                    ch_id, 
-                    cover_to_use, 
-                    caption=f" **{p_title}**\n\n", 
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
-                )
-            else:
-                await bot.send_message(
-                    ch_id, 
-                    f" **{p_title}**\n\n", 
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
-                )
-            success += 1
-        except Exception as e:
-            print(f"Gagal kirim ke {ch_id}: {e}")
-
-    await c.message.edit_text(f"✅ Berhasil dipost ke {success} channel.")
-    await state.clear()
-@dp.message(F.chat.type == "private", (F.photo | F.video | F.document), StateFilter(PostMedia.waiting_for_final_confirm))
-async def handle_next_part(m: Message, state: FSMContext):
-    data = await state.get_data()
-    fid = m.photo[-1].file_id if m.photo else (m.video.file_id if m.video else m.document.file_id)
-    mtype = "photo" if m.photo else "video"
-    await state.update_data(temp_fid=fid, temp_type=mtype, temp_caption=(m.caption or ""))
-    await add_part_to_list(m, state, data['current_title'])
-
-@dp.callback_query(PostMedia.waiting_for_final_confirm, F.data == "final_post")
-async def final_post_handler(c: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    parts, p_title = data['parts'], data['current_title']
-    bot_user = (await bot.get_me()).username
-    
-    # Generate Keyboard Parts
-    kb_rows = []
-    row = []
-    for i, code in enumerate(parts, 1):
-        row.append(InlineKeyboardButton(text=f"Part {i}", url=f"https://t.me/{bot_user}?start={code}"))
-        if len(row) == 2: kb_rows.append(row); row = []
-    if row: kb_rows.append(row)
-    
-    # MULTI CHANNEL (Fitur 7) & COVER (Fitur 9)
-    ch_id = await get_config("channel_post") # Nanti bisa dikembangin ke multi-loop
-    cover_mode = await get_config("cover_mode", "OFF")
-    cover_file = await get_config("cover_file_id")
-    
-    load = await loading_anim(c.message)
-    try:
-        if cover_mode == "ON" and cover_file:
-            await bot.send_photo(ch_id, cover_file, caption=f"🎬 **{p_title}**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        else:
-            # Jika mode OFF, kirim tanpa cover atau kirim file part 1 sebagai cover
-            await bot.send_message(ch_id, f"🎬 **{p_title}**\n\nSilahkan pilih part di bawah:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        await load.edit_text("✅ BERHASIL DI POST!")
-    except Exception as e:
-        await load.edit_text(f"❌ GAGAL: {e}")
-    
-    await state.clear()
-# ================= MEMBER INTERACTION (FORWARDED) =================
-@dp.callback_query(F.data == "menu_ask")
-async def ask_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim pesanmu:"); await state.set_state(MemberStates.waiting_for_ask)
-
-@dp.message(MemberStates.waiting_for_ask)
-async def process_ask(m: Message, state: FSMContext):
-    await m.forward(OWNER_ID)
-    await bot.send_message(OWNER_ID, f"📩 **ASK DARI: {m.from_user.id}**", 
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ REPLY", callback_data=f"reply:{m.from_user.id}")]]))
-    await m.reply("✅ Terkirim."); await state.clear()
-
-@dp.callback_query(F.data == "menu_donasi")
-async def donasi_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim donasi/pesan:"); await state.set_state(MemberStates.waiting_for_donation)
-
-@dp.message(MemberStates.waiting_for_donation)
-async def process_donation(m: Message, state: FSMContext):
-    cap = m.caption or m.text or "Tanpa pesan"
-    await m.forward(OWNER_ID)
-    await bot.send_message(OWNER_ID, f"🎁 **DONASI BARU**\nUser: `{m.from_user.id}`\nCaption: {cap}")
-    await m.reply("✅ Terkirim."); await state.clear()
-
-@dp.callback_query(F.data == "menu_vip")
-async def order_vip(c: CallbackQuery, state: FSMContext):
-    qris = await get_config("qris_file_id")
-    if not qris: return await c.answer("QRIS kosong.", show_alert=True)
-    await bot.send_photo(c.message.chat.id, qris, caption="Kirim SS Bukti Bayar:")
-    await state.set_state(MemberStates.waiting_for_vip_ss)
-
-@dp.callback_query(F.data == "vip_preview")
-async def preview_vip(c: CallbackQuery):
-    prev = await get_config("preview_msg_id")
-    if prev: await bot.copy_message(c.message.chat.id, OWNER_ID, int(prev))
-    else: await c.answer("Preview kosong.")
-
-@dp.message(MemberStates.waiting_for_vip_ss, F.photo)
-async def process_vip_ss(m: Message, state: FSMContext):
-    # Kirim ke Admin (Owner)
-    await m.forward(OWNER_ID)
-    
-    # Tombol buat Admin ambil tindakan
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ APPROVE", callback_data=f"vip_action:approve:{m.from_user.id}"),
-            InlineKeyboardButton(text="❌ REJECT", callback_data=f"vip_action:reject:{m.from_user.id}")
-        ],
-        [InlineKeyboardButton(text="💬 CHAT USER", callback_data=f"reply:{m.from_user.id}")]
-    ])
-    
-    await bot.send_message(
-        OWNER_ID, 
-        f"💎 **BUKTI TRANSFER BARU**\n\n"
-        f"User: `{m.from_user.id}`\n"
-        f"Nama: {m.from_user.full_name}",
-        reply_markup=kb
-    )
-    await m.reply("✅ Bukti transfer telah dikirim ke Admin. Mohon tunggu proses verifikasi.")
-    await state.clear()
-# ================= COMMAND ADMIN UTAMA =================
+async def wait_msg(m: Message):
+    return await m.answer("⏳ Tunggu sebentar...")
+# ================= cmd ===============
 @dp.message(Command("ray"))
 async def cmd_ray(m: Message):
     if not await is_admin(m.from_user.id): return
     teks = (
-        "🛠 **DAFTAR COMMAND ADMIN** 🛠\n\n"
-        "**MANAJEMEN POSTING & TAMPILAN:**\n"
-        "🔹 `/setpostch` - Set channel untuk posting\n"
-        "🔹 `/setfsub` - Set channel/grup wajib join (FSub)\n"
-        "🔹 `/listfsub` - Lihat daftar FSub saat ini\n"
-        "🔹 `/fsubteks` - Set teks peringatan FSub\n"
-        "🔹 `/setcove` - Set gambar cover default\n"
-        "🔹 `/autocover on` / `/autocover off` - Matikan/nyalakan auto cover\n\n"
-        "**MANAJEMEN VIP & REFERRAL:**\n"
-        "🔹 `/setqris` - Set gambar QRIS VIP\n"
-        "🔹 `/setpreview` - Set media preview VIP\n"
-        "🔹 `/setvipgrup` - Set grup VIP (auto-generate link)\n"
-        "🔹 `/setloggrup` - Set log channel/grup\n"
-        "🔹 `/setreffch` - Set channel tujuan referral\n\n"
-        "**SISTEM ADMIN & BROADCAST:**\n"
-        "🔹 `/setadmin` - Tambah admin baru (Khusus Owner)\n"
-        "🔹 `/delladmin` - Hapus admin (Khusus Owner)\n"
-        "🔹 `/listadmin` - Lihat daftar admin\n"
-        "🔹 `/bc` - Broadcast pesan ke semua user\n"
-        "🔹 `/senddb` - Backup database (Khusus Owner)\n"
-        "🔹 `/update` - Update database dari file (Khusus Owner)"
+        "<b>🏠 MENU ADMIN RAY</b>\n\n"
+        "<b>⚙️ Konfigurasi:</b>\n"
+        "/setpostch - Set Channel Post\n"
+        "/setfsub - Set Force Subs\n"
+        "/listfsub - List FSub aktif\n"
+        "/fsubteks - Set Teks FSub\n"
+        "/setcove - Set Cover Default\n"
+        "/autocover on/off - Toggle Cover\n"
+        "/setloggrup - Set Log Grup\n\n"
+        "<b>💰 VIP & Reff:</b>\n"
+        "/setqris - Set QRIS VIP\n"
+        "/setpreview - Set Preview VIP\n"
+        "/setvipgrup - Set Grup VIP\n"
+        "/setreffch - Set Channel Reff\n\n"
+        "<b>👥 Admin:</b>\n"
+        "/setadmin - Tambah Admin\n"
+        "/delladmin - Hapus Admin\n"
+        "/listadmin - List Admin\n\n"
+        "<b>📦 System:</b>\n"
+        "/bc - Broadcast\n"
+        "/senddb - Ambil Database\n"
+        "/update - Update Database"
     )
     await m.reply(teks)
 
 @dp.message(Command("setadmin"))
-async def cmd_setadmin(m: Message, state: FSMContext):
-    if m.from_user.id != OWNER_ID: return await m.reply("❌ Khusus Owner!")
-    await m.reply("Kirim ID Telegram user yang mau dijadikan Admin:")
+async def set_admin_cmd(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID: return
+    await m.reply("Kirim ID user yang ingin dijadikan admin:")
     await state.set_state(AdminStates.waiting_for_add_admin)
 
 @dp.message(AdminStates.waiting_for_add_admin)
 async def process_add_admin(m: Message, state: FSMContext):
     try:
-        new_admin = int(m.text.strip())
+        aid = int(m.text)
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT OR IGNORE INTO admins (admin_id) VALUES (?)", (new_admin,))
+            await db.execute("INSERT OR IGNORE INTO admins VALUES (?)", (aid,))
             await db.commit()
-        await m.reply(f"✅ User `{new_admin}` berhasil ditambahkan sebagai Admin.")
-    except ValueError:
-        await m.reply("❌ Error: ID harus berupa angka!")
+        await m.reply(f"✅ User {aid} berhasil jadi admin.")
+    except:
+        await m.reply("❌ Kirim ID berupa angka.")
     await state.clear()
 
+@dp.message(Command("listadmin"))
+async def list_admin_cmd(m: Message):
+    if not await is_admin(m.from_user.id): return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT admin_id FROM admins") as cur:
+            rows = await cur.fetchall()
+    teks = f"<b>Owner:</b> <code>{OWNER_ID}</code>\n<b>Admins:</b>\n"
+    for r in rows: teks += f"- <code>{r[0]}</code>\n"
+    await m.reply(teks)
+
 @dp.message(Command("delladmin"))
-async def cmd_delladmin(m: Message, state: FSMContext):
-    if m.from_user.id != OWNER_ID: return await m.reply("❌ Khusus Owner!")
-    await m.reply("Kirim ID Telegram Admin yang mau dihapus:")
+async def del_admin_cmd(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID: return
+    await m.reply("Kirim ID admin yang ingin dihapus:")
     await state.set_state(AdminStates.waiting_for_del_admin)
 
 @dp.message(AdminStates.waiting_for_del_admin)
 async def process_del_admin(m: Message, state: FSMContext):
     try:
-        target = int(m.text.strip())
+        aid = int(m.text)
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("DELETE FROM admins WHERE admin_id=?", (target,))
+            await db.execute("DELETE FROM admins WHERE admin_id = ?", (aid,))
             await db.commit()
-        await m.reply(f"✅ Admin `{target}` berhasil dihapus dari database.")
-    except ValueError:
-        await m.reply("❌ Error: ID harus berupa angka!")
+        await m.reply(f"✅ Admin {aid} dihapus.")
+    except: await m.reply("❌ ID tidak valid.")
     await state.clear()
-
-@dp.message(Command("listadmin"))
-async def cmd_listadmin(m: Message):
-    if not await is_admin(m.from_user.id): return
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM admins") as cur:
-            rows = await cur.fetchall()
-    
-    teks = "👑 **DAFTAR ADMIN SAAT INI**\n\n"
-    teks += f"👤 Owner ID: `{OWNER_ID}`\n"
-    if rows:
-        for r in rows:
-            teks += f"👮‍♂️ Admin ID: `{r[0]}`\n"
-    else:
-        teks += "\nBelum ada admin tambahan."
-    await m.reply(teks)
 
 @dp.message(Command("setpostch"))
 async def cmd_setpostch(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...")
-    await m.answer("Kirimkan ID Channel atau Username Channel (@ch) untuk tujuan posting utama:")
-    await state.set_state(AdminStates.waiting_for_post_channel)
+    await wait_msg(m)
+    await m.answer("Kirim ID/Username Channel tujuan post (bisa banyak, pisahkan dengan spasi):")
+    await state.set_state(AdminStates.waiting_for_post_ch)
 
-@dp.message(AdminStates.waiting_for_post_channel)
-async def process_setpostch(m: Message, state: FSMContext):
-    val = m.text.strip()
-    await set_config("post_channel", val)
-    await m.reply(f"✅ Channel posting berhasil diatur ke: `{val}`")
+@dp.message(AdminStates.waiting_for_post_ch)
+async def process_postch(m: Message, state: FSMContext):
+    await set_config("post_channels", m.text.strip())
+    await m.reply(f"✅ Channel post diatur ke: <code>{m.text}</code>")
     await state.clear()
+
+@dp.message(Command("fsubteks"))
+async def cmd_fsubteks(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await wait_msg(m)
+    await m.answer("Kirim teks FSub (Emoji/Format akan disamakan):")
+    await state.set_state(AdminStates.waiting_for_fsub_text)
+
+@dp.message(AdminStates.waiting_for_fsub_text)
+async def process_fsub_txt(m: Message, state: FSMContext):
+    await set_config("fsub_text", m.text)
+    await m.reply("✅ Teks FSub berhasil diperbarui.")
+    await state.clear()
+
+@dp.message(Command("setfsub"))
+async def cmd_setfsub(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await wait_msg(m)
+    info = (
+        "Kirim daftar FSub dengan format:\n\n"
+        "Menyamping: <code>Nama ID - Nama ID</code>\n"
+        "Kebawah: <code>Nama ID (pake enter) Nama ID</code>"
+    )
+    await m.answer(info)
+    await state.set_state(AdminStates.waiting_for_fsub)
+
+@dp.message(AdminStates.waiting_for_fsub)
+async def process_fsub_list(m: Message, state: FSMContext):
+    await set_config("fsub_list", m.text.strip())
+    await m.reply("✅ Daftar FSub berhasil disimpan.")
+    await state.clear()
+
+@dp.message(Command("listfsub"))
+async def cmd_listfsub(m: Message):
+    if not await is_admin(m.from_user.id): return
+    val = await get_config("fsub_list", "Kosong")
+    await m.reply(f"📜 **Daftar FSub:**\n<code>{val}</code>")
 
 @dp.message(Command("autocover"))
 async def cmd_autocover(m: Message):
     if not await is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) < 2:
-        return await m.reply("Gunakan format: `/autocover on` atau `/autocover off`")
-    
-    status = args[1].lower()
-    if status in ["on", "off"]:
+    status = m.text.split()[-1].lower()
+    if status in ['on', 'off']:
         await set_config("auto_cover", status)
-        await m.reply(f"✅ Auto Cover berhasil diubah ke: **{status.upper()}**")
+        await m.reply(f"✅ Auto Cover: {status.upper()}")
     else:
-        await m.reply("❌ Pilihan hanya 'on' atau 'off'!")
+        await m.reply("Gunakan /autocover on atau off")
 
 @dp.message(Command("setcove"))
 async def cmd_setcove(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan Foto/Media untuk dijadikan Cover default:")
+    await m.reply("Kirim Foto untuk Cover Default:")
     await state.set_state(AdminStates.waiting_for_cover)
-
-@dp.message(AdminStates.waiting_for_cover)
-async def process_setcove(m: Message, state: FSMContext):
-    if not m.photo:
-        return await m.reply("❌ Mohon kirimkan dalam bentuk FOTO!")
-    file_id = m.photo[-1].file_id
-    await set_config("default_cover", file_id)
-    await m.reply("✅ Cover default berhasil diperbarui!")
-    await state.clear()
 
 @dp.message(Command("setqris"))
 async def cmd_setqris(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan Foto QRIS untuk pembayaran VIP:")
+    await m.reply("Kirim Foto QRIS VIP:")
     await state.set_state(AdminStates.waiting_for_qris)
-
-@dp.message(AdminStates.waiting_for_qris)
-async def process_setqris(m: Message, state: FSMContext):
-    if not m.photo:
-        return await m.reply("❌ Mohon kirimkan dalam bentuk FOTO!")
-    file_id = m.photo[-1].file_id
-    await set_config("qris_image", file_id)
-    await m.reply("✅ Foto QRIS berhasil diperbarui!")
-    await state.clear()
 
 @dp.message(Command("setpreview"))
 async def cmd_setpreview(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan Media (Foto/Video) untuk Preview VIP:")
+    await m.reply("Kirim Foto/Video untuk Preview VIP:")
     await state.set_state(AdminStates.waiting_for_preview)
 
-@dp.message(AdminStates.waiting_for_preview)
-async def process_setpreview(m: Message, state: FSMContext):
-    file_id = ""
-    if m.photo: file_id = m.photo[-1].file_id
-    elif m.video: file_id = m.video.file_id
-    else: return await m.reply("❌ Kirim Foto atau Video!")
+@dp.message(StateFilter(AdminStates.waiting_for_cover, AdminStates.waiting_for_qris, AdminStates.waiting_for_preview))
+async def process_admin_media_configs(m: Message, state: FSMContext):
+    current = await state.get_state()
+    fid = ""
+    if m.photo: fid = m.photo[-1].file_id
+    elif m.video: fid = m.video.file_id
+    else: return await m.reply("❌ Kirim Media!")
+
+    if current == AdminStates.waiting_for_cover: await set_config("default_cover", fid)
+    elif current == AdminStates.waiting_for_qris: await set_config("qris_img", fid)
+    elif current == AdminStates.waiting_for_preview: await set_config("vip_preview", fid)
     
-    await set_config("vip_preview", file_id)
-    await m.reply("✅ Media Preview VIP berhasil diperbarui!")
+    await m.reply("✅ Berhasil diperbarui.")
     await state.clear()
 
 @dp.message(Command("setvipgrup"))
-async def cmd_setvipgrup(m: Message, state: FSMContext):
+async def set_vip_g(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan ID Grup VIP (Pastikan bot sudah jadi admin di sana):")
-    await state.set_state(AdminStates.waiting_for_vip_group)
+    await m.reply("Kirim ID Grup VIP:")
+    await state.set_state(AdminStates.waiting_for_vip_grup)
 
-@dp.message(AdminStates.waiting_for_vip_group)
-async def process_setvipgrup(m: Message, state: FSMContext):
-    val = m.text.strip()
-    await set_config("vip_group_id", val)
-    await m.reply(f"✅ ID Grup VIP diatur ke: `{val}`")
+@dp.message(AdminStates.waiting_for_vip_grup)
+async def process_vip_g(m: Message, state: FSMContext):
+    await set_config("vip_group", m.text)
+    await m.reply("✅ Grup VIP diset.")
     await state.clear()
 
 @dp.message(Command("setloggrup"))
-async def cmd_setlogch(m: Message, state: FSMContext):
+async def set_log_g(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan ID Channel/Grup Log:")
-    await state.set_state(AdminStates.waiting_for_log_group)
+    await m.reply("Kirim ID Grup/Channel Log:")
+    await state.set_state(AdminStates.waiting_for_log_grup)
 
-@dp.message(AdminStates.waiting_for_log_group)
-async def process_setlogch(m: Message, state: FSMContext):
-    val = m.text.strip()
-    await set_config("log_channel", val)
-    await m.reply(f"✅ ID Log diatur ke: `{val}`")
+@dp.message(AdminStates.waiting_for_log_grup)
+async def process_log_g(m: Message, state: FSMContext):
+    await set_config("log_group", m.text)
+    await m.reply("✅ Log Grup diset.")
     await state.clear()
 
 @dp.message(Command("setreffch"))
-async def cmd_setreffch(m: Message, state: FSMContext):
+async def set_reff_c(m: Message, state: FSMContext):
     if not await is_admin(m.from_user.id): return
-    await m.reply("⏳ Tunggu sebentar...\nKirimkan Username/ID Channel tujuan Referral:")
-    await state.set_state(AdminStates.waiting_for_ref_channel)
+    await m.reply("Kirim Username Channel Reff (@ch):")
+    await state.set_state(AdminStates.waiting_for_reff_ch)
 
-@dp.message(AdminStates.waiting_for_ref_channel)
-async def process_setreffch(m: Message, state: FSMContext):
-    val = m.text.strip()
-    await set_config("ref_channel", val)
-    await m.reply(f"✅ Channel Referral diatur ke: `{val}`")
+@dp.message(AdminStates.waiting_for_reff_ch)
+async def process_reff_c(m: Message, state: FSMContext):
+    await set_config("ref_ch", m.text)
+    await m.reply("✅ Channel Reff diset.")
     await state.clear()
+# --- Helper untuk menyimpan PostData di Memory per user ---
+post_temp = {}
 
-@dp.callback_query(F.data == "set_post")
-async def set_post_menu(c: CallbackQuery):
-    # Menampilkan list channel yang sudah terdaftar
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_id FROM channels") as cur:
-            rows = await cur.fetchall()
+@dp.message(F.media_group_id) # Mencegah error jika kirim album sekaligus
+async def handle_media_group(m: Message):
+    await m.reply("❌ Mohon kirim media satu per satu (jangan album) agar sistem part berfungsi dengan baik.")
+
+@dp.message(F.photo | F.video)
+async def start_post_flow(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
     
-    text = "📢 **DAFTAR CHANNEL POSTING**\n\n"
-    if rows:
-        for r in rows: text += f"• `{r[0]}`\n"
+    # Inisialisasi data post untuk user ini
+    uid = m.from_user.id
+    post_temp[uid] = PostData()
+    
+    fid = m.photo[-1].file_id if m.photo else m.video.file_id
+    m_type = "photo" if m.photo else "video"
+    post_temp[uid].media_list.append({"file_id": fid, "type": m_type})
+    
+    await m.reply("⏳ Tunggu sebentar...\nSilakan masukkan **Judul** atau ketik /batal")
+    await state.set_state(AdminStates.waiting_for_title)
+
+@dp.message(AdminStates.waiting_for_title)
+async def process_title(m: Message, state: FSMContext):
+    if m.text == "/batal":
+        post_temp.pop(m.from_user.id, None)
+        await state.clear()
+        return await m.reply("✅ Posting dibatalkan.")
+    
+    uid = m.from_user.id
+    post_temp[uid].title = m.text
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ TAMBAH PART LAIN", callback_data="add_more_part")],
+        [InlineKeyboardButton(text="🚀 POST SEKARANG", callback_data="post_final")]
+    ])
+    
+    await m.reply(f"Judul: <b>{m.text}</b>\nMedia tersimpan: {len(post_temp[uid].media_list)}", reply_markup=kb)
+
+@dp.callback_query(F.data == "add_more_part")
+async def add_more_part_btn(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("⏳ Tunggu sebentar...\nSilakan kirim media selanjutnya:")
+    await state.set_state(AdminStates.waiting_for_more_media)
+    await c.answer()
+
+@dp.message(AdminStates.waiting_for_more_media, F.photo | F.video)
+async def process_more_media(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    fid = m.photo[-1].file_id if m.photo else m.video.file_id
+    m_type = "photo" if m.photo else "video"
+    
+    post_temp[uid].media_list.append({"file_id": fid, "type": m_type})
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ TAMBAH PART LAIN", callback_data="add_more_part")],
+        [InlineKeyboardButton(text="🚀 POST SEKARANG", callback_data="post_final")]
+    ])
+    await m.reply(f"✅ Berhasil ditambah!\nTotal Media: {len(post_temp[uid].media_list)}", reply_markup=kb)
+
+@dp.callback_query(F.data == "post_final")
+async def post_final_check(c: CallbackQuery, state: FSMContext):
+    uid = c.from_user.id
+    acover = await get_config("auto_cover", "off")
+    
+    if acover == "off":
+        await c.message.answer("⏳ Tunggu sebentar...\nAuto Cover <b>OFF</b>. Silakan kirim <b>GAMBAR COVER</b> manual:")
+        await state.set_state(AdminStates.waiting_for_manual_cover)
     else:
-        text += "Belum ada channel."
-    
-    kb = [
-        [InlineKeyboardButton(text="➕ TAMBAH CHANNEL", callback_data="add_ch_post")],
-        [InlineKeyboardButton(text="🗑 HAPUS SEMUA", callback_data="clear_ch_post")],
-        [InlineKeyboardButton(text="🔙 KEMBALI", callback_data="open_settings")]
-    ]
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        # Langsung pilih channel
+        await show_channel_options(c.message, uid)
+    await c.answer()
 
-@dp.callback_query(F.data == "add_ch_post")
-async def add_ch_start(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim ID Channel (contoh: -100xxx):")
-    await state.set_state(AdminStates.waiting_for_channel_post)
-
-@dp.message(AdminStates.waiting_for_channel_post)
-async def save_new_ch(m: Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO channels (channel_id) VALUES (?)", (m.text.strip(),))
-        await db.commit()
-    await m.reply("✅ Channel ditambahkan ke list!")
+@dp.message(AdminStates.waiting_for_manual_cover, F.photo)
+async def process_manual_cover(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    # Simpan cover manual sementara di object PostData
+    post_temp[uid].manual_cover = m.photo[-1].file_id
+    await show_channel_options(m, uid)
     await state.clear()
 
-@dp.callback_query(F.data == "set_fsub_list")
-async def set_fsub_cb(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim username (spasi): `@ch1 @ch2`:"); await state.set_state(AdminStates.waiting_for_fsub_list)
+async def show_channel_options(m, uid):
+    ch_raw = await get_config("post_channels", "")
+    if not ch_raw:
+        return await m.reply("❌ Belum ada channel post yang diset! Gunakan /setpostch")
+    
+    channels = ch_raw.split()
+    kb_list = []
+    for ch in channels:
+        kb_list.append([InlineKeyboardButton(text=f"📤 Ke {ch}", callback_data=f"send_to:{ch}")])
+    
+    kb_list.append([InlineKeyboardButton(text="🌍 POST KE SEMUA CHANNEL", callback_data="send_to_all")])
+    
+    await m.answer("⏳ Tunggu sebentar...\nPilih channel tujuan posting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list))
 
-@dp.message(AdminStates.waiting_for_fsub_list)
-async def process_fsub(m: Message, state: FSMContext):
-    await set_config("fsub_channels", m.text.strip()); await m.reply("✅ Set."); await state.clear()
+@dp.callback_query(F.data.startswith("send_to"))
+async def execute_post(c: CallbackQuery, state: FSMContext):
+    uid = c.from_user.id
+    target = c.data.split(":")[1] if ":" in c.data else "ALL"
+   
+    state_data = await state.get_data()
+    donasi_prefix = state_data.get("donasi_prefix")
+    
+    # 1. LOGIKA JIKA INI ADALAH DONASI MEMBER
+    if donasi_prefix:
+        target_user = state_data.get("current_donasi_user")
+        caption = f"{donasi_prefix} donasi member"
+        
+        msg_ref = c.message.reply_to_message
+        
+        fid = ""
+        m_type = ""
+        if msg_ref.photo: 
+            fid, m_type = msg_ref.photo[-1].file_id, "photo"
+        elif msg_ref.video: 
+            fid, m_type = msg_ref.video.file_id, "video"
+        elif msg_ref.voice: 
+            fid, m_type = msg_ref.voice.file_id, "voice"
 
-@dp.callback_query(F.data == "menu_db", F.from_user.id == OWNER_ID)
-async def send_db_cb(c: CallbackQuery):
-    if os.path.exists(DB_NAME): await c.message.reply_document(FSInputFile(DB_NAME))
+        ch_list = (await get_config("post_channels")).split() if target == "ALL" else [target]
+        for ch in ch_list:
+            try:
+                if m_type == "photo": await bot.send_photo(ch, photo=fid, caption=caption)
+                elif m_type == "video": await bot.send_video(ch, video=fid, caption=caption)
+                elif m_type == "voice": await bot.send_voice(ch, voice=fid, caption=caption)
+            except: pass
+        
+        await bot.send_message(target_user, "🌟 Donasi kamu sudah diposting ke channel! Terima kasih.")
+        await c.message.edit_text(f"✅ Donasi berhasil diposting ke {target}.")
+        await state.clear()
+        return
+        
+    data = post_temp.get(uid)
+    if not data:
+        return await c.answer("❌ Data tidak ditemukan.", show_alert=True)
+
+    default_c = await get_config("default_cover")
+    cover_to_use = getattr(data, 'manual_cover', default_c)
+    
+    if not cover_to_use:
+        return await c.answer("❌ Cover tidak ditemukan! Set dulu di /setcove atau kirim manual.", show_alert=True)
+
+    # Generate Unique ID untuk Database Store (agar link button aman)
+    import uuid
+    post_id = str(uuid.uuid4())[:8]
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO media_store VALUES (?, ?)", (post_id, json.dumps(data.media_list)))
+        await db.commit()
+
+    # Buat Tombol Nonton
+    kb_post = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 NONTON SEKARANG", url=f"https://t.me/{(await bot.get_me()).username}?start={post_id}")]
+    ])
+    
+    caption = f"<b>{data.title}</b>"
+    ch_list = (await get_config("post_channels")).split() if target == "ALL" else [target]
+
+    success = 0
+    for ch in ch_list:
+        try:
+            await bot.send_photo(ch, photo=cover_to_use, caption=caption, reply_markup=kb_post)
+            success += 1
+        except Exception as e:
+            print(f"Gagal kirim ke {ch}: {e}")
+
+    await c.message.edit_text(f"✅ Berhasil dipost ke {success} channel!")
+    post_temp.pop(uid, None)
     await c.answer()
 
 @dp.message(Command("update"))
-async def update_database(m: Message):
-    if not await is_admin(m.from_user.id): return
-    if not m.reply_to_message or not m.reply_to_message.document: return await m.reply("❌ Reply .db")
-    file = await bot.get_file(m.reply_to_message.document.file_id)
-    await bot.download_file(file.file_path, DB_NAME)
-    await init_db(); await m.reply("✅ UPDATED")
+async def cmd_update(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID: return
+    await m.reply("Silakan kirim file <code>media.db</code> untuk update data.")
+    await state.set_state(AdminStates.waiting_for_update_db)
 
-@dp.callback_query(F.data.startswith("reply:"))
-async def reply_cb(c: CallbackQuery, state: FSMContext):
-    await state.update_data(target=c.data.split(":")[1])
-    await c.message.answer("Ketik balasan:"); await state.set_state(AdminStates.waiting_for_reply)
-
-@dp.message(AdminStates.waiting_for_reply)
-async def process_reply_send(m: Message, state: FSMContext):
-    d = await state.get_data()
-    try: await m.copy_to(d['target']); await m.reply("✅ OK")
-    except: await m.reply("❌ Gagal")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("vip_action:"))
-async def vip_decision(c: CallbackQuery):
-    # Cek apakah yang mencet beneran admin
-    if not await is_admin(c.from_user.id):
-        return await c.answer("Lu bukan admin!", show_alert=True)
-
-    data = c.data.split(":")
-    action = data[1]     # approve atau reject
-    target_id = int(data[2]) # ID user yang mau di-acc
+@dp.message(AdminStates.waiting_for_update_db, F.document)
+async def process_update_db(m: Message, state: FSMContext):
+    if not m.document.file_name.endswith(".db"):
+        return await m.reply("❌ Harus file .db!")
     
-    log_ch = await get_config("log_group") # Ambil ID grup log dari database
-    
-    if action == "approve":
-        vip_group = await get_config("vip_group")
-        if not vip_group: 
-            return await c.answer("❌ Error: Group VIP belum diset di /panel!", show_alert=True)
-        
-        try:
-            # Fitur 2: Link otomatis max 1 orang
-            link = await bot.create_chat_invite_link(chat_id=vip_group, member_limit=1)
-            
-            await bot.send_message(
-                target_id, 
-                f"✅ **PEMBAYARAN DISETUJUI!**\n\nSelamat datang di VIP. Ini link akses kamu:\n{link.invite_link}\n\n*Note: Link ini hanya bisa diklik satu kali.*"
-            )
-            await c.message.edit_text(f"✅ User `{target_id}` Berhasil di-Approve.")
-
-            # Fitur 3: Kirim ke VIP JOIN LOGGER
-            if log_ch:
-                try:
-                    # Ambil info user buat di log
-                    u = await bot.get_chat(target_id)
-                    log_msg = (
-                        f"👥 **VIP JOIN LOGGER**\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"👤 **Nama:** [{u.first_name}](tg://user?id={target_id})\n"
-                        f"🆔 **ID:** `{target_id}`\n"
-                        f"🔗 **Profil:** [Klik Disini](tg://user?id={target_id})\n"
-                        f"✅ **Status:** Manual Approved"
-                    )
-                    await bot.send_message(log_ch, log_msg)
-                except: pass # Biar ga eror kalau bot belum join grup log
-                
-        except Exception as e:
-            await c.answer(f"Gagal buat link: {e}", show_alert=True)
-            
-    elif action == "reject":
-        try:
-            await bot.send_message(target_id, "❌ **PEMBAYARAN DITOLAK**\n\nMohon maaf, bukti transfer kamu tidak valid atau tidak terbaca. Silahkan hubungi admin.")
-            await c.message.edit_text(f"❌ User `{target_id}` Berhasil di-Reject.")
-        except: pass
-@dp.callback_query(F.data == "top_weekly")
-async def top_weekly_handler(c: CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
-        query = """
-            SELECT COALESCE(m.title, 'Video'), COUNT(v.user_id) as total, m.code
-            FROM views v
-            JOIN media m ON v.media_code = m.code
-            GROUP BY v.media_code
-            ORDER BY total DESC
-            LIMIT 5
-        """
-        async with db.execute(query) as cur:
-            rows = await cur.fetchall()
-
-    if not rows:
-        return await c.answer("📊 Belum ada data. Ayo tonton video dulu!", show_alert=True)
-
-    text = "🏆 **TOP 5 VIDEO REAL-TIME**\n\n"
-    kb = []
-    bot_user = (await bot.get_me()).username
-    for i, row in enumerate(rows, 1):
-        text += f"{i}. {row[0]} — ({row[1]} views)\n"
-        kb.append([InlineKeyboardButton(text=f"▶️ NONTON: {row[0]}", url=f"https://t.me/{bot_user}?start={row[2]}")])
-    
-    kb.append([InlineKeyboardButton(text="🔙 KEMBALI", callback_data="close_panel")])
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    
-# --- FITUR 10 & 11: REFERRAL SYSTEM ---
-@dp.callback_query(F.data == "menu_ref")
-async def ref_info(c: CallbackQuery):
-    text = (
-        "🚀 **REFERRAL VIP SYSTEM**\n\n"
-        "Ajak 20 orang join bot ini dan dapatkan AKSES VIP GRATIS!\n"
-        "1. Klik setuju untuk buat link.\n"
-        "2. Sebar link kamu.\n"
-        "3. Jika capai 20 orang, klik klaim."
-    )
-    kb = [[InlineKeyboardButton(text="✅ SETUJU & BUAT LINK", callback_data="gen_ref_link")],
-          [InlineKeyboardButton(text="📊 CEK STATUS / KLAIM", callback_data="status_ref")]]
-    await c.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-# --- FITUR 10 & 11: REFERRAL SYSTEM (OPTIMIZED) ---
-
-@dp.callback_query(F.data == "menu_ref")
-async def ref_info(c: CallbackQuery):
-    # Tahap 1: Penjelasan awal (Sesuai permintaanmu)
-    text = (
-        "🚀 **PROGRAM REFERRAL VIP**\n\n"
-        "Dapatkan akses VIP Gratis dengan mengajak 20 teman!\n\n"
-        "**Cara Kerja:**\n"
-        "1. Klik setuju untuk membuat link referral khusus.\n"
-        "2. Sebarkan link tersebut ke teman atau grup.\n"
-        "3. Setiap orang yang join lewat linkmu, poin bertambah.\n"
-        "4. Setelah 20 poin, kamu bisa klaim hadiah ke Admin."
-    )
-    kb = [
-        [InlineKeyboardButton(text="✅ SETUJU & BUAT LINK", callback_data="gen_ref_link")],
-        [InlineKeyboardButton(text="❌ TOLAK", callback_data="close_panel")]
-    ]
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@dp.callback_query(F.data == "gen_ref_link")
-async def gen_ref_handler(c: CallbackQuery):
-    ref_ch = await get_config("ref_channel")
-    if not ref_ch: 
-        return await c.answer("❌ Admin belum mengatur Channel Referral!", show_alert=True)
+    file_path = "temp_update.db"
+    await bot.download(m.document, destination=file_path)
     
     try:
-        # Tahap 2: Link baru dibuat HANYA jika setuju
-        link = await bot.create_chat_invite_link(chat_id=ref_ch, name=f"REF_{c.from_user.id}")
+        source_conn = sqlite3.connect(file_path)
+        dest_conn = sqlite3.connect(DB_NAME)
+        cursor = source_conn.cursor()
         
-        text = (
-            "✅ **LINK REFERRAL KAMU SIAP!**\n\n"
-            f"Silakan sebarkan link ini:\n`{link.invite_link}`\n\n"
-            "Bot akan memberitahumu setiap ada orang yang join."
-        )
-        kb = [[InlineKeyboardButton(text="📊 CEK PROGRES", callback_data="status_ref")]]
-        await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        # Ambil data media_store
+        cursor.execute("SELECT * FROM media_store")
+        rows = cursor.fetchall()
+        
+        added = 0
+        dest_cursor = dest_conn.cursor()
+        for row in rows:
+            # INSERT OR IGNORE agar tidak error jika ID sudah ada
+            dest_cursor.execute("INSERT OR IGNORE INTO media_store VALUES (?, ?)", row)
+            if dest_cursor.rowcount > 0:
+                added += 1
+        
+        dest_conn.commit()
+        source_conn.close()
+        dest_conn.close()
+        os.remove(file_path)
+        await m.reply(f"✅ Berhasil sinkronisasi! {added} data baru ditambahkan.")
     except Exception as e:
-        await c.message.answer(f"❌ Gagal: Pastikan bot Admin di {ref_ch}")
-
-@dp.chat_member()
-async def tracking_public_join(event: ChatMemberUpdated):
-    # Tahap 3: Notifikasi Pribadi setiap ada yang join
-    if event.new_chat_member.status == "member":
-        invite_link = event.invite_link
-        if invite_link and invite_link.name and invite_link.name.startswith("REF_"):
-            try:
-                inviter_id = int(invite_link.name.split("_")[1])
-                new_user_id = event.from_user.id
-                if inviter_id == new_user_id: return
-
-                async with aiosqlite.connect(DB_NAME) as db:
-                    # Anti-cheat: satu user diajak cuma dihitung sekali
-                    res = await db.execute("SELECT 1 FROM referrals WHERE invited_user=?", (new_user_id,))
-                    if await res.fetchone(): return
-
-                    await db.execute("INSERT INTO referrals (owner_id, invited_user) VALUES (?, ?)", (inviter_id, new_user_id))
-                    async with db.execute("SELECT COUNT(*) FROM referrals WHERE owner_id=?", (inviter_id,)) as cur:
-                        count = (await cur.fetchone())[0]
-                    await db.commit()
-                
-                # Kasih tau secara pribadi
-                if count == 20:
-                    text_win = "🎊 **SELAMAT!** Kamu berhasil mengajak 20 orang!\n\nKlik tombol di bawah untuk klaim hadiah VIP kamu."
-                    kb_win = [[InlineKeyboardButton(text="🎁 KLAIM HADIAH VIP", callback_data="klaim_ref_reward")]]
-                    await bot.send_message(inviter_id, text_win, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_win))
-                else:
-                    await bot.send_message(inviter_id, f"🔔 **Poin Masuk!**\nSeseorang join via link kamu.\nTotal: `{count}` / 20")
-            except: pass
-
-@dp.callback_query(F.data == "status_ref")
-async def status_ref(c: CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM referrals WHERE owner_id=?", (c.from_user.id,)) as cur:
-            count = (await cur.fetchone())[0]
+        await m.reply(f"❌ Gagal: {e}")
+    await state.clear()
+# ================= LOGIKA FSUB PARSER =================
+async def get_fsub_kb(user_id, post_id=None):
+    fsub_raw = await get_config("fsub_list", "")
+    if not fsub_raw: return None
+    
+    rows = []
+    lines = fsub_raw.split('\n')
+    for line in lines:
+        if not line.strip(): continue
+        side_by_side = line.split('-')
+        current_row = []
+        for item in side_by_side:
+            parts = item.strip().split()
+            if len(parts) < 2: continue
+            name, target_id = " ".join(parts[:-1]), parts[-1]
             
-    text = f"📊 **STATUS REFERRAL**\n\nProgres: `{count}` / 20 orang."
-    kb = []
-    if count >= 20:
-        kb.append([InlineKeyboardButton(text="🎁 KLAIM VIP", callback_data="klaim_ref_reward")])
-    kb.append([InlineKeyboardButton(text="🔙 KEMBALI", callback_data="menu_ref")])
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+            try:
+                member = await bot.get_chat_member(target_id, user_id)
+                if member.status in ["left", "kicked"]:
+                    current_row.append(InlineKeyboardButton(text=name, url=f"https://t.me/{target_id.replace('@','')}"))
+            except:
+                current_row.append(InlineKeyboardButton(text=name, url=f"https://t.me/{target_id.replace('@','')}"))
+        
+        if current_row: rows.append(current_row)
+    
+    if rows:
+        if post_id:
+            rows.append([InlineKeyboardButton(text="🔄 COBA LAGI", callback_data=f"check:{post_id}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+    return None
+# ================= HANDLER MEMBER =================
+@dp.message(CommandStart())
+async def cmd_start(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    args = m.text.split()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,)) as cur:
+            is_new_user = await cur.fetchone() is None
 
-@dp.callback_query(F.data == "klaim_ref_reward")
-async def process_klaim_ref(c: CallbackQuery):
-    # Tahap 4: Forward ke Admin untuk Approve
+        if is_new_user:
+            referrer_id = None
+            if len(args) > 1 and args[1].startswith("ref_"):
+                try:
+                    referrer_id = int(args[1].replace("ref_", ""))
+                    if referrer_id != uid: # Tidak bisa mengundang diri sendiri
+                        await db.execute(
+                            "UPDATE users SET ref_count = ref_count + 1 WHERE user_id = ?", 
+                            (referrer_id,)
+                        )
+                        # Notif ke pengundang (Opsional)
+                        try:
+                            await bot.send_message(referrer_id, "🔔 Seseorang bergabung menggunakan link kamu! +1 Poin.")
+                        except: pass
+                except: pass
+            
+            # Masukkan user baru ke DB
+            await db.execute("INSERT INTO users (user_id, referrer) VALUES (?, ?)", (uid, referrer_id))
+            await db.commit()
+
+    if len(args) > 1 and not args[1].startswith("ref_"):
+        post_id = args[1]
+        kb_fsub = await get_fsub_kb(uid)
+        if kb_fsub:
+            txt = await get_config("fsub_text")
+            kb_fsub.inline_keyboard.append([InlineKeyboardButton(text="🔄 COBA LAGI", url=f"https://t.me/{(await bot.get_me()).username}?start={post_id}")])
+            return await m.reply(txt, reply_markup=kb_fsub)
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT media_data FROM media_store WHERE msg_unique_id = ?", (post_id,)) as cur:
+                row = await cur.fetchone()
+        
+        if row:
+            await wait_msg(m)
+            media_list = json.loads(row[0])
+            for i, med in enumerate(media_list):
+                caption = f"Part {i+1}" if len(media_list) > 1 else ""
+                if med['type'] == "photo":
+                    await bot.send_photo(uid, photo=med['file_id'], caption=caption, protect_content=True)
+                else:
+                    await bot.send_video(uid, video=med['file_id'], caption=caption, protect_content=True)
+            return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❓ ASK ADMIN", callback_data="member_ask"), InlineKeyboardButton(text="🎁 DONASI", callback_data="member_donasi")],
+        [InlineKeyboardButton(text="💎 ORDER VIP", callback_data="member_vip"), InlineKeyboardButton(text="👀 PREVIEW VIP", callback_data="member_preview")],
+        [InlineKeyboardButton(text="🔗 REFERRAL", callback_data="member_reff")]
+    ])
+    await m.reply(f"Halo {m.from_user.first_name}! Selamat datang di Bot Media.", reply_markup=kb)
+# --- Fitur Referral ---
+@dp.callback_query(F.data == "member_reff")
+async def reff_menu(c: CallbackQuery):
+    uid = c.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT ref_count FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+    
+    bot_user = (await bot.get_me()).username
+    link = f"https://t.me/{bot_user}?start=ref_{uid}"
+    
+    txt = (
+        "<b>🔗 PROGRAM REFERRAL</b>\n\n"
+        f"Undang teman untuk bergabung dan dapatkan VIP Gratis!\n"
+        f"Minimal: 20 Orang\n"
+        f"Progress Kamu: <b>{count}/20</b>\n\n"
+        f"Link Referral Kamu:\n<code>{link}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ SAYA SETUJU & AMBIL LINK", callback_data="gen_reff")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="back_home")]
+    ])
+    await c.message.edit_text(txt, reply_markup=kb)
+
+@dp.callback_query(F.data == "member_ask")
+async def ask_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Silakan kirim pesan yang ingin disampaikan ke admin:")
+    await state.set_state(AdminStates.waiting_for_ask)
+    await c.answer()
+
+@dp.message(AdminStates.waiting_for_ask)
+async def process_ask(m: Message, state: FSMContext):
+    await bot.send_message(OWNER_ID, f"📩 **PESAN ASK BARU** dari <code>{m.from_user.id}</code>:")
+    await m.forward(OWNER_ID)
+    await m.reply("✅ Pesan berhasil terkirim, silakan tunggu balasan.")
+    await state.clear()
+
+@dp.callback_query(F.data == "member_donasi")
+async def donasi_start(c: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨 COWO", callback_data="donasi:CO"), InlineKeyboardButton(text="👩 CEWE", callback_data="donasi:CE")]
+    ])
+    await c.message.edit_text("Pilih kategori donasi kamu:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("donasi:"))
+async def donasi_type(c: CallbackQuery, state: FSMContext):
+    dtype = c.data.split(":")[1]
+    await state.update_data(donasi_type=dtype)
+    await c.message.answer("Silakan kirim Media atau Voice Note untuk didonasikan:")
+    await state.set_state(AdminStates.waiting_for_donation_media)
+    await c.answer()
+
+@dp.message(AdminStates.waiting_for_donation_media, F.photo | F.video | F.voice)
+async def process_donasi_media(m: Message, state: FSMContext):
+    data = await state.get_data()
+    dtype = data.get("donasi_type", "CO")
+    prefix = "co" if dtype == "CO" else "ce"
+    
     kb_admin = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ APPROVE (Kirim Link VIP)", callback_data=f"vip_action:approve:{c.from_user.id}"),
-            InlineKeyboardButton(text="❌ TOLAK", callback_data=f"reply:{c.from_user.id}")
-        ]
+        [InlineKeyboardButton(text="✅ APPROVE", callback_data=f"app_donasi:{m.from_user.id}:{prefix}"), 
+         InlineKeyboardButton(text="❌ REJECT", callback_data=f"rej_donasi:{m.from_user.id}")]
     ])
     
-    await bot.send_message(
-        OWNER_ID, 
-        f"📩 **KLAIM REFERRAL BARU**\n\n"
-        f"User: `{c.from_user.id}`\n"
-        f"Nama: {c.from_user.full_name}\n"
-        f"Poin: 20 (Sistem Terverifikasi)",
-        reply_markup=kb_admin
-    )
-    await c.message.edit_text("✅ **PERMINTAAN KLAIM TERKIRIM!**\nAdmin akan segera memberikan link VIP kamu. Mohon tunggu.")
-
-# --- SET CHANNEL REFERRAL (ADMIN ONLY) ---
-@dp.callback_query(F.data == "set_ref_ch")
-async def set_ref_ch_btn(c: CallbackQuery, state: FSMContext):
-    await c.message.answer("Kirim username channel (@channel) tempat referral bekerja:")
-    await state.set_state(AdminStates.waiting_for_ref_channel)
-
-@dp.message(AdminStates.waiting_for_ref_channel)
-async def save_ref_ch(m: Message, state: FSMContext):
-    await set_config("ref_channel", m.text.strip())
-    await m.reply(f"✅ Channel Referral Set ke: {m.text}")
+    await bot.send_message(OWNER_ID, f"🎁 **DONASI BARU** dari <code>{m.from_user.id}</code> ({prefix}):")
+    await m.forward(OWNER_ID)
+    await bot.send_message(OWNER_ID, "Tindakan:", reply_markup=kb_admin)
+    
+    await m.reply("✅ Donasi berhasil terkirim, terimakasih sudah berdonasi!")
     await state.clear()
+
+@dp.callback_query(F.data == "member_vip")
+async def vip_order(c: CallbackQuery, state: FSMContext):
+    qris = await get_config("qris_img")
+    if not qris: return await c.answer("❌ Admin belum set QRIS.", show_alert=True)
+    
+    await bot.send_photo(c.from_user.id, photo=qris, caption="Silakan scan QRIS di atas dan kirim bukti pembayaran (Screenshot) ke sini:")
+    await state.set_state(AdminStates.waiting_for_vip_ss)
+    await c.answer()
+
+@dp.message(AdminStates.waiting_for_vip_ss, F.photo)
+async def process_vip_ss(m: Message, state: FSMContext):
+    kb_admin = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ APPROVE", callback_data=f"app_vip:{m.from_user.id}"), 
+         InlineKeyboardButton(text="❌ REJECT", callback_data=f"rej_vip:{m.from_user.id}")]
+    ])
+    await bot.send_message(OWNER_ID, f"💰 **ORDER VIP** dari <code>{m.from_user.id}</code>:")
+    await m.forward(OWNER_ID)
+    await bot.send_message(OWNER_ID, "Konfirmasi Pembayaran:", reply_markup=kb_admin)
+    await m.reply("✅ Bukti berhasil dikirim, mohon tunggu admin sedang cek.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith(("app_vip", "rej_vip")))
+async def handle_approval(c: CallbackQuery):
+    action = c.data.split(":")[0]
+    target_id = int(c.data.split(":")[1])
+    
+    if action == "app_vip":
+        # Generate Link VIP
+        vip_chat = await get_config("vip_group")
+        try:
+            link = await bot.create_chat_invite_link(vip_chat, member_limit=1)
+            await bot.send_message(target_id, f"✅ Pembayaran Valid! Ini link grup VIP kamu:\n{link.invite_link}")
+            await c.message.edit_text("✅ Berhasil dikirim ke user.")
+        except:
+            await c.answer("❌ Gagal generate link. Pastikan ID Grup benar & Bot Admin.", show_alert=True)
+            
+    elif action == "rej_vip":
+        await bot.send_message(target_id, "❌ Bukti pembayaran kamu tidak valid.")
+        await c.message.edit_text("❌ Ditolak.")
+        
+    await c.answer()
+    
+@dp.callback_query(F.data.startswith(("app_donasi:", "rej_donasi:")))
+async def handle_donasi_approval(c: CallbackQuery, state: FSMContext):
+    data_parts = c.data.split(":")
+    action = data_parts[0]
+    target_id = int(data_parts[1])
+    
+    if action == "app_donasi":
+        prefix = data_parts[2] # 'ce' atau 'co'
+        # Simpan prefix ke state sementara untuk proses posting
+        await state.update_data(current_donasi_user=target_id, donasi_prefix=prefix)
+        
+        # Ambil media dari pesan yang di-forward (pesan yang di-reply oleh tombol ini)
+        # Kita perlu kirim ulang logika pilih channel seperti posting biasa
+        await c.message.answer(f"✅ Donasi ({prefix}) disetujui. Pilih channel untuk posting:")
+        await show_channel_options(c.message, c.from_user.id)
+        
+    elif action == "rej_donasi":
+        try:
+            await bot.send_message(target_id, "❌ Maaf, donasi kamu ditolak oleh admin karena tidak sesuai kriteria.")
+            await c.message.edit_text(f"❌ Donasi dari {target_id} telah ditolak.")
+        except:
+            await c.message.edit_text(f"❌ Ditolak, tapi gagal memberitahu user (bot diblokir).")
+    
+    await c.answer()
+
+@dp.callback_query(F.data == "back_home")
+async def back_home(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❓ ASK ADMIN", callback_data="member_ask"), InlineKeyboardButton(text="🎁 DONASI", callback_data="member_donasi")],
+        [InlineKeyboardButton(text="💎 ORDER VIP", callback_data="member_vip"), InlineKeyboardButton(text="👀 PREVIEW VIP", callback_data="member_preview")],
+        [InlineKeyboardButton(text="🔗 REFERRAL", callback_data="member_reff")]
+    ])
+    await c.message.edit_text(f"Halo {c.from_user.first_name}! Ada yang bisa dibantu?", reply_markup=kb)
+
+@dp.callback_query(F.data == "gen_reff")
+async def check_claim(c: CallbackQuery):
+    uid = c.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT ref_count FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+    
+    if count >= 20:
+        await bot.send_message(OWNER_ID, f"🔔 **KLAIM REFERRAL**\nUser: <code>{uid}</code> berhasil mencapai {count} poin!")
+        await c.answer("✅ Permintaan klaim dikirim ke admin!", show_alert=True)
+    else:
+        await c.answer(f"Poin kamu baru {count}, butuh {20-count} lagi untuk klaim.", show_alert=True)
+# --- System Commands ---
+@dp.message(Command("senddb"))
+async def cmd_senddb(m: Message):
+    if m.from_user.id != OWNER_ID: return
+    # Memaksa nama file menjadi media.db
+    file = FSInputFile(DB_NAME, filename="media.db")
+    await m.reply_document(file, caption="Backup Database Terbaru")
+
+@dp.message(Command("bc"))
+async def cmd_bc(m: Message, state: FSMContext):
+    if not await is_admin(m.from_user.id): return
+    await m.reply("Kirim pesan broadcast:")
+    await state.set_state(AdminStates.waiting_for_bc)
+
+@dp.message(AdminStates.waiting_for_bc)
+async def process_bc(m: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            users = await cur.fetchall()
+    
+    success = 0
+    for u in users:
+        try:
+            await m.copy_to(u[0])
+            success += 1
+            await asyncio.sleep(0.05)
+        except: pass
+    await m.reply(f"✅ Broadcast selesai ke {success} user.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("check:"))
+async def check_fsub_btn(c: CallbackQuery):
+    pid = c.data.split(":")[1]
+    kb = await get_fsub_kb(c.from_user.id, pid)
+    if kb:
+        return await c.answer("❌ Kamu belum join semua channel!", show_alert=True)
+    
+    # Jika sudah join semua, hapus pesan fsub dan kirim medianya
+    await c.message.delete()
+    # Panggil fungsi kirim media (send_media_logic)
+    await send_media_to_user(c.from_user.id, pid)
     
 async def main():
-    await init_db() 
-    await init_payment_table()
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    # WAJIB: Tambahkan allowed_updates agar bot bisa dapet info member join
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"])
+    await init_db()
+    print("Bot is Running...")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    try:
+        asyncio.run(main())
+    except:
+        pass
